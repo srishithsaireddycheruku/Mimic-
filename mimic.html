@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MIMIC & TTS Web App</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 2rem;
+            text-align: center;
+        }
+        .audio-player {
+            margin-top: 1rem;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .hidden {
+            display: none;
+        }
+        .visible {
+            display: block;
+        }
+        #loading-section .spinner {
+            border: 4px solid rgba(0, 0, 0, 0.1);
+            border-left-color: #4F46E5;  /* Tailwind indigo-500 */
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 1rem auto;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest"></script>
+    <script src="https://unpkg.com/librosa"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/soundfile/0.12.1/soundfile.js"></script>
+    <script>
+        // Polyfill for TextEncoder and TextDecoder (required for some environments)
+        if (typeof TextEncoder === 'undefined') {
+            class TextEncoder {
+                encode(string) {
+                    return new Uint8Array(string.split('').map(c => c.charCodeAt(0)));
+                }
+            }
+            window.TextEncoder = TextEncoder;
+        }
+        if (typeof TextDecoder === 'undefined') {
+            class TextDecoder {
+                decode(bytes) {
+                    let result = '';
+                    for (let i = 0; i < bytes.length; i++) {
+                        result += String.fromCharCode(bytes[i]);
+                    }
+                    return result;
+                }
+            }
+            window.TextDecoder = TextDecoder;
+        }
+    </script>
+</head>
+<body class="bg-gradient-to-r from-purple-400 to-blue-500 min-h-screen flex items-center justify-center">
+    <div class="container bg-white rounded-lg shadow-md p-8">
+        <h1 class="text-3xl font-semibold text-gray-800 mb-6">MIMIC & TTS</h1>
+        <div id="upload-section" class="mb-6">
+            <h2 class="text-xl font-medium text-gray-700 mb-4">Upload Audio (Voice Conversion)</h2>
+            <h3 class="text-lg font-semibold text-gray-700 mt-2">Voice Input</h3>
+            <input type="file" id="voice-input" accept="audio/*" class="mb-4">
+            <h3 class="text-lg font-semibold text-gray-700 mt-2">Song Input</h3>
+            <input type="file" id="song-input" accept="audio/*" class="mb-4">
+            <button id="process-button" class="bg-indigo-500 hover:bg-indigo-700 text-white font-bold py-2 px-4 rounded">Process Audio</button>
+            <p id="file-error" class="text-red-500 text-sm mt-2 hidden">Please upload both voice and song audio files.</p>
+        </div>
+
+        <div id="tts-section" class="mb-6">
+            <h2 class="text-xl font-medium text-gray-700 mb-4">Text-to-Speech</h2>
+            <textarea id="text-input" placeholder="Enter text to speak..." class="w-full p-2 border border-gray-300 rounded mb-4"></textarea>
+            <select id="voice-select" class="w-full p-2 border border-gray-300 rounded mb-4">
+                <option value="">Loading voices...</option>
+            </select>
+            <button id="speak-button" class="bg-green-500 hover:bg-green-700 text-white font-bold py-2 px-4 rounded">Speak Text</button>
+        </div>
+
+        <div id="loading-section" class="mb-6 hidden">
+            <h2 class="text-xl font-medium text-gray-700 mb-4">Processing Audio...</h2>
+            <div class="spinner"></div>
+        </div>
+
+        <div id="audio-section" class="mb-6 hidden">
+            <h2 class="text-xl font-medium text-gray-700 mb-4">Result</h2>
+            <audio id="output-audio" controls class="audio-player"></audio>
+        </div>
+
+        <div id="error-section" class="mb-6 hidden">
+            <h2 class="text-xl font-medium text-red-600 mb-4">Error</h2>
+            <p id="error-message" class="text-red-500"></p>
+        </div>
+    </div>
+
+    <script>
+    const voiceInput = document.getElementById('voice-input');
+    const songInput = document.getElementById('song-input');
+    const processButton = document.getElementById('process-button');
+    const loadingSection = document.getElementById('loading-section');
+    const audioSection = document.getElementById('audio-section');
+    const outputAudio = document.getElementById('output-audio');
+    const errorSection = document.getElementById('error-section');
+    const errorMessage = document.getElementById('error-message');
+    const fileError = document.getElementById('file-error');
+
+    const textInput = document.getElementById('text-input');
+    const speakButton = document.getElementById('speak-button');
+    const voiceSelect = document.getElementById('voice-select');
+
+    let voices = [];
+    const synth = window.speechSynthesis;
+
+    function populateVoiceList() {
+        voices = synth.getVoices();
+        voiceSelect.innerHTML = '';
+        if (voices.length === 0) {
+            voiceSelect.innerHTML = '<option value="">No voices available</option>';
+            return;
+        } else {
+            for (let i = 0; i < voices.length; i++) {
+                const option = document.createElement('option');
+                option.textContent = `${voices[i].name} (${voices[i].lang})`;
+                option.value = i;
+                voiceSelect.appendChild(option);
+            }
+            voiceSelect.selectedIndex = 0;
+        }
+    }
+    populateVoiceList();
+    if (synth.onvoiceschanged !== undefined) {
+        synth.onvoiceschanged = populateVoiceList;
+    }
+
+
+
+    // --- Helper Functions ---
+    /**
+     * Loads an audio file using librosa (simulated in the browser).  Handles file reading and stereo to mono conversion.
+     * @param {File} file - The audio file to load.
+     * @param {number} sr - The sample rate (optional, default: 22050).
+     * @returns {Promise<Float32Array>} - A Promise that resolves with the audio data as a Float32Array.
+     */
+    function loadAudio(file, sr = 22050) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = function(event) {
+                const arrayBuffer = event.target.result;
+
+                // Use a simplified approach to simulate librosa.load (for demonstration in browser)
+                // Here, we assume the audio is a WAV file and handle stereo and mono.
+                if (file.name.toLowerCase().endsWith('.wav')) {
+                    const data = new DataView(arrayBuffer);
+                    const numChannels = data.getUint16(22, true);
+                    const sampleRate = data.getUint32(24, true);
+                    const bitsPerSample = data.getUint16(34, true);
+                    const dataOffset = data.getUint32(20, true) + 4;
+
+                    if (bitsPerSample !== 16) {
+                        reject(new Error('Only 16-bit audio is supported.'));
+                        return;
+                    }
+
+                    let audioData;
+                    if (numChannels === 1) {
+                        audioData = new Float32Array((arrayBuffer.byteLength - dataOffset) / 2);
+                        for (let i = 0, j = dataOffset; j < arrayBuffer.byteLength; i++, j += 2) {
+                            const sample = data.getInt16(j, true);
+                            audioData[i] = sample / 32768;
+                        }
+                    } else if (numChannels === 2) {
+                        // Stereo audio:  Mix down to mono by averaging the two channels.
+                        audioData = new Float32Array((arrayBuffer.byteLength - dataOffset) / 4); // Divide by 4 for stereo
+                        for (let i = 0, j = dataOffset; j < arrayBuffer.byteLength; i++, j += 4) {
+                            const leftSample = data.getInt16(j, true);
+                            const rightSample = data.getInt16(j + 2, true);
+                            audioData[i] = (leftSample + rightSample) / (2 * 32768);
+                        }
+                    } else {
+                        reject(new Error('Only mono and stereo audio are supported.'));
+                        return;
+                    }
+
+                    if (sampleRate !== sr) {
+                        console.warn(`Sample rate in file (${sampleRate}) does not match requested sample rate (${sr}). Resampling is not implemented in this simplified example.`);
+                    }
+                    resolve(audioData);
+
+                } else {
+                    reject(new Error('Unsupported audio format. Only WAV is supported in this simplified example.'));
+                }
+            };
+            reader.onerror = function(error) {
+                reject(error);
+            };
+            reader.readAsArrayBuffer(file);
+        });
+    }
+
+
+    /**
+     * Extracts Mel spectrogram features from the audio data.
+     * @param {Float32Array} audio - The audio data.
+     * @param {number} sr - The sample rate.
+     * @param {number} n_fft - The FFT size.
+     * @param {number} hop_length - The hop length.
+     * @param {number} n_mels - The number of Mel bands.
+     * @returns {Promise<tf.Tensor>} - A Promise that resolves with the Mel spectrogram as a TensorFlow tensor.
+     */
+    async function extractMelSpectrogram(audio, sr = 22050, n_fft = 2048, hop_length = 512, n_mels = 80) {
+        return new Promise(async (resolve, reject) => {
+            try {
+                const melSpectrogramTransform = new MelSpectrogram({
+                    sampleRate: sr,
+                    fftSize: n_fft,
+                    hopLength: hop_length,
+                    numMelBands: n_mels
+                });
+
+                const melSpectrogram = melSpectrogramTransform.process(audio);
+                const powerToDb = new AmplitudeToDB();
+                const logMelSpectrogram = powerToDb.process(melSpectrogram);
+
+                resolve(logMelSpectrogram);
+            } catch (error) {
+                reject(error);
+            }
+        });
+    }
+
+    /**
+     * Performs voice conversion using pre-trained models (simplified for the browser).
+     * @param {tf.Tensor} songFeatures - The Mel spectrogram of the song.
+     * @returns {Promise<Float32Array>} -  A Promise that resolves with the synthesized audio as Float32Array.
+     */
+    async function performVoiceConversion(songFeatures) {
+        // --- 2. Bidirectional RNN for Pitch Tracking (Simplified) ---
+        class PitchRNN extends tf.layers.Layer {
+            constructor(config) {
+                super(config);
+            }
+
+            build(inputShape) {
+                this.lstm = tf.layers.lstm({
+                    units: 128,
+                    returnSequences: true,
+                    goBackwards: true,
+                });
+                this.fc = tf.layers.dense({ units: 1 });
+            }
+
+            call(inputs) {
+                const lstmOutput = this.lstm.apply(inputs);
+                return this.fc.apply(lstmOutput);
+            }
+
+            static get className() {
+                return 'PitchRNN';
+            }
+        }
+        tf.serialization.registerClass(PitchRNN);
+
+        const pitchModel = await tf.loadLayersModel('model/pitch_model/model.json');
+        const predictedPitch = pitchModel.predict(songFeatures);
+
+        // --- 3. GNN for Timbre Matching (Simplified) ---
+        class TimbreGNN extends tf.layers.Layer {
+            constructor(config) {
+                super(config);
+            }
+
+            build(inputShape) {
+                this.dense1 = tf.layers.dense({ units: 64, activation: 'relu' });
+                this.dense2 = tf.layers.dense({ units: 80 });
+            }
+
+            call(inputs) {
+                const x = this.dense1.apply(inputs);
+                return this.dense2.apply(x);
+            }
+
+            static get className() {
+                return 'TimbreGNN';
+            }
+        }
+        tf.serialization.registerClass(TimbreGNN);
+        const timbreGNN = await tf.loadLayersModel('model/timbre_model/model.json');
+
+        // Placeholder for edge_index (simplified for browser demo)
+        const numFrames = songFeatures.shape[2];
+        const edgeIndex = tf.tensor2d([], [2, 0], 'int32');
+        const transformedTimbre = timbreGNN.predict(songFeatures);
+
+        // --- 4. Voice Generator (Simplified CycleGAN Generator) ---
+        class VoiceGenerator extends tf.layers.Layer {
+            constructor(config) {
+                super(config);
+            }
+
+            build(inputShape) {
+                this.dense1 = tf.layers.dense({ units: 256, activation: 'relu' });
+                this.dense2 = tf.layers.dense({ units: 80, activation: 'sigmoid' });
+            }
+
+            call(inputs) {
+                const x = this.dense1.apply(inputs);
+                return this.dense2.apply(x);
+            }
+            static get className() {
+                return 'VoiceGenerator';
+            }
+        }
+        tf.serialization.registerClass(VoiceGenerator);
+        const voiceGan = await tf.loadLayersModel('model/voice_generator/model.json');
+        const transformedVoiceMel = voiceGan.predict(songFeatures);
+
+        // --- 5. HiFi-GAN Vocoder (Simplified) ---
+        class HiFiGAN extends tf.layers.Layer {
+            constructor(config) {
+                super(config);
+            }
+
+            build(inputShape) {
+                this.conv1 = tf.layers.conv1d({
+                    filters: 256,
+                    kernelSize: 3,
+                    strides: 1,
+                    padding: 'same',
+                    activation: 'relu',
+                    useBias: true,
+                });
+                this.conv2 = tf.layers.conv1d({
+                    filters: 1,
+                    kernelSize: 3,
+                    strides: 1,
+                    padding: 'same',
+                    activation: 'tanh',
+                    useBias: true,
+                });
+            }
+
+            call(inputs) {
+                let x = this.conv1.apply(inputs);
+                return this.conv2.apply(x);
+            }
+            static get className() {
+                return 'HiFiGAN';
+            }
+        }
+        tf.serialization.registerClass(HiFiGAN);
+
+        const hifiGan = await tf.loadLayersModel('model/hifi_gan/model.json');
+        const hifiGanInput = transformedVoiceMel;
+        const synthesizedAudioTensor = hifiGan.predict(hifiGanInput);
+
+        // Convert the TensorFlow tensor to a Float32Array for audio playback
+        const audioData = await synthesizedAudioTensor.data();
+        return audioData;
+    }
+
+    /**
+     * Saves the audio data to a WAV file (handling stereo and mono).
+     * @param {Float32Array} audioData - The audio data.
+     * @param {number} sampleRate - The sample rate.
+     * @param {number} numChannels - The number of channels (1 for mono, 2 for stereo).
+     * @returns {Promise<string>} - A Promise that resolves with a data URL representing the WAV file.
+     */
+    function saveAudio(audioData, sampleRate = 22050, numChannels = 1) {
+        return new Promise((resolve, reject) => {
+            try {
+                const bitsPerSample = 16;
+                const bytesPerSample = bitsPerSample / 8;
+                const blockAlign = numChannels * bytesPerSample;
+                const dataSize = audioData.length * bytesPerSample;
+                const buffer = new ArrayBuffer(44 + dataSize);
+                const data = new DataView(buffer);
+
+                // --- WAV Header ---
+                writeString(data, 0, 'RIFF');
+                data.setUint32(4, 36 + dataSize, true);
+                writeString(data, 8, 'WAVE');
+                writeString(data, 12, 'fmt ');
+                data.setUint32(16, 16, true);
+                data.setUint16(20, 1, true);  // PCM format
+                data.setUint16(22, numChannels, true);
+                data.setUint32(24, sampleRate, true);
+                data.setUint32(28, sampleRate * numChannels * bytesPerSample, true);
+                data.setUint16(32, blockAlign, true);
+                data.setUint16(34, bitsPerSample, true);
+                writeString(data, 36, 'data');
+                data.setUint32(40, dataSize, true);
+
+                // --- Audio Data ---
+                let offset = 44;
+                if (numChannels === 1) {
+                    for (let i = 0; i < audioData.length; i++) {
+                        const sample = Math.max(-1, Math.min(1, audioData[i]));
+                        const sampleValue = sample < 0 ? sample * 32768 : sample * 32767;
+                        data.setInt16(offset, sampleValue, true);
+                        offset += bytesPerSample;
+                    }
+                } else if (numChannels === 2) {
+                    for (let i = 0; i < audioData.length; i++) {
+                        const sample = Math.max(-1, Math.min(1, audioData[i]));
+                        const sampleValue = sample < 0 ? sample * 32768 : sample * 32767;
+                        data.setInt16(offset, sampleValue, true);
+                        data.setInt16(offset + 2, sampleValue, true); // Write the same sample for both channels
+                        offset += 2 * bytesPerSample; // Increment by 4 for stereo (2 samples * 2 bytes/sample)
+                    }
+                }
+
+
+                // Create a data URL for the WAV file
+                const blob = new Blob([buffer], { type: 'audio/wav' });
+                const reader = new FileReader();
+                reader.onloadend = function() {
+                    resolve(reader.result);
+                };
+                reader.onerror = reject;
+                reader.readAsDataURL(blob);
+
+            } catch (error) {
+                reject(error);
+            }
+        });
+    }
+
+    /**
+     * Writes a string to the DataView at a specified offset.
+     * @param {DataView} data - The DataView to write to.
+     * @param {number} offset - The offset at which to start writing.
+     * @param {string} string - The string to write.
+     */
+    function writeString(data, offset, string) {
+        for (let i = 0; i < string.length; i++) {
+            data.setUint8(offset + i, string.charCodeAt(i));
+        }
+    }
+
+    // --- Event Handlers ---
+    processButton.addEventListener('click', async () => {
+        const voiceFile = voiceInput.files[0];
+        const songFile = songInput.files[0];
+
+        if (!voiceFile || !songFile) {
+            fileError.classList.remove('hidden');
+            return;
+        }
+        fileError.classList.add('hidden');
+        loadingSection.classList.remove('hidden');
+        audioSection.classList.add('hidden');
+        errorSection.classList.add('hidden');
+
+        try {
+            const voiceAudioData = await loadAudio(voiceFile);
+            const songAudioData = await loadAudio(songFile);
+
+            const songFeatures = await extractMelSpectrogram(songAudioData);
+
+            const synthesizedAudio = await performVoiceConversion(songFeatures);
+            const audioURL = await saveAudio(synthesizedAudio, 22050, 1);  // Mono output
+
+
+            outputAudio.src = audioURL;
+            audioSection.classList.remove('hidden');
+            loadingSection.classList.add('hidden');
+
+        } catch (error) {
+            console.error("Error during processing:", error);
+            errorMessage.textContent = error.message;
+            errorSection.classList.remove('hidden');
+            loadingSection.classList.add('hidden');
+        }
+    });
+
+    speakButton.addEventListener('click', () => {
+        const text = textInput.value.trim();
+        if (text === '') return;
+
+        const utterance = new SpeechSynthesisUtterance(text);
+        utterance.voice = voices[voiceSelect.value];
+        synth.speak(utterance);
+    });
+    </script>
+</body>
+</html>
